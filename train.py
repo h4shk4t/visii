@@ -26,13 +26,14 @@ def get_parser():
     parser.add_argument('--embedding_learning_rate', type=float, default=None)
     parser.add_argument('--image_folder', type=str, default=None)
     parser.add_argument('--log_dir', type=str, default='./logs')
+    parser.add_argument('--top_percentile', type=int, default=10)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = get_parser()
     print(args)
-
+    
     with open(args.config_file, "r") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     if args.subfolder is not None:
@@ -74,6 +75,8 @@ if __name__ == "__main__":
 
             # load CLIP model
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            # "clip_model": "ViT-H-14",
+            # "clip_pretrain": "laion2b_s32b_b79k"
             model, _, preprocess = open_clip.create_model_and_transforms(args1.clip_model, pretrained=args1.clip_pretrain, device=device)
 
             print(f"Running for {args1.iter} steps.")
@@ -107,12 +110,13 @@ if __name__ == "__main__":
             lambda_mse=config['hyperparams']['lambda_mse'],
             eval_step = config['hyperparams']['eval_step'],
             log_dir=args.log_dir,
+            top_percent=args.top_percentile,
             )
 
         if config['exp']['eval']:
             checkpoints = [os.path.join(log_dir, 'prompt_embeds_{}.pt'.format(x)) for x in np.arange(0, config['hyperparams']['optimization_steps'], config['hyperparams']['eval_step'])]
             after_images = np.concatenate([np.array(cond_image), np.array(target_image)], axis=1)
-            location = os.path.join(log_dir, 'eval_{}'.format(config['hyperparams']['eval_step']) + '.png')
+            location = os.path.join(log_dir, 'eval_{}'.format(config['hyperparams']['eval_step']) + '_top_'+str(args.top_percentile)+'.png')
             for checkpoint in checkpoints:
                 opt_embs = torch.load(checkpoint)
                 after_image = pipe.test(prompt_embeds=opt_embs,

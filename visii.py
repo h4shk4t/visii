@@ -733,6 +733,63 @@ class StableDiffusionVisii(DiffusionPipeline):
         # image_latents = torch.cat(image_latents, dim=0)
         return image_latents
 
+    def remove_similar_patches(self, cond_images, target_images, top_percent=10, device="cuda"):
+        criterion_cosine = nn.CosineSimilarity()
+        with torch.no_grad():
+            clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+            processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
+            clip_model.eval().to(device)
+            patch_size = 16
+            cond_patches = []
+            target_patches = []
+            for cond_image, target_image in zip(cond_images, target_images):
+                cond_patches.extend(self.get_patches(cond_image, patch_size))
+                target_patches.extend(self.get_patches(target_image, patch_size))
+            
+            similar_patch_pairs = []
+
+            for cond_patch, target_patch in zip(cond_patches, target_patches):
+                cond_patch_input = processor(images=cond_patch, return_tensors="pt").to(device)
+                target_patch_input = processor(images=target_patch, return_tensors="pt").to(device)
+                cond_features = clip_model.vision_model(cond_patch_input['pixel_values'])[1]
+                cond_features = clip_model.visual_projection(cond_features)
+                target_features = clip_model.vision_model(target_patch_input['pixel_values'])[1]
+                target_features = clip_model.visual_projection(target_features)
+                similarity = criterion_cosine(cond_features, target_features)
+                similar_patch_pairs.append((i, similarity.item()))
+
+            # Sort pairs based on similarity
+            similar_patch_pairs.sort(key=lambda x: x[1], reverse=True)
+
+            # Select top 10% pairs
+            top_n = int(len(similar_patch_pairs) * top_percent / 100)
+            top_similar_patch_pairs = similar_patch_pairs[:top_n]
+
+            # # Zero out the patches in the selected pairs
+            # for (idx, _) in top_similar_patch_pairs:
+            #     cond_patches_flat[idx].zero_()
+            #     target_patches_flat[idx].zero_()
+
+            return top_similar_patch_pairs
+
+    def get_patches(self, image: Image, patch_size: int):
+        patches = []
+        width, height = image.size
+        for i in range(0, height, patch_size):
+            for j in range(0, width, patch_size):
+                patch = image.crop((j, i, j + patch_size, i + patch_size))
+                patches.append(patch)
+        return patches
+    
+    def reassemble_image(self, patches, image_shape, patch_size):
+        image = torch.zeros(image_shape)
+        k = 0
+        for i in range(0, image_shape[0], patch_size):
+            for j in range(0, image_shape[1], patch_size):
+                image[i:i+patch_size, j:j+patch_size] = patches[k]
+                k += 1
+        return image
+    
     def text_projection(self, cond_image, target_image, device='cuda'):
         with torch.no_grad():
             clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
@@ -780,6 +837,51 @@ class StableDiffusionVisii(DiffusionPipeline):
 
         return text_projection, edit_direction_embed
 
+    def text_projection2_edited(self, cond_images, target_images, top_percent,device='cuda'):
+        with torch.no_grad():
+            clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+            processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
+            clip_model.eval().to(device)
+            
+            img_inputs = processor(images=[cond_images[0],target_images[0]], return_tensors="pt").to(device)
+            x = clip_model.vision_model(img_inputs['pixel_values'])
+            x0 = x[0][0]
+            x1 = x[0][1]
+
+            similarities = F.cosine_similarity(x0, x1, dim=-1)
+            threshold = similarities.quantile(1-top_percent/100)
+
+            mask = similarities >= threshold
+            x0[mask] = 0
+            x1[mask] = 0
+            
+            delx = x1 - x0
+            mask = mask[1:]
+            mask_16x16 = mask.view(16, 16).float()
+            mask_224x224 = F.interpolate(mask_16x16.unsqueeze(0).unsqueeze(0), size=(224, 224), mode='nearest').squeeze()
+            mask_224x224_cpu = mask_224x224.cpu().numpy() * 255
+            mask_image = Image.fromarray(mask_224x224_cpu.astype('uint8'), mode='L')
+
+            # pooled_features_cond = clip_model.vision_model.post_layernorm(x0[:, 0, :])
+            # pooled_features_cond = clip_model.visual_projection(pooled_features_cond)
+
+            # pooled_features_target = clip_model.vision_model.post_layernorm(x1[:, 0, :])
+            # pooled_features_target = clip_model.visual_projection(pooled_features_target)
+            # before_embed = pooled_features[0:1]
+            # after_embed = pooled_features[1:2]
+            # breakpoint()
+
+            edit_direction_embed = torch.mean(clip_model.visual_projection(delx), dim=0, keepdim=True)
+
+            # edit_direction_embed = pooled_features_target.mean(dim=0) - pooled_features_cond.mean(dim=0)
+            edit_direction_embed = edit_direction_embed / edit_direction_embed.norm(p=2, dim=-1, keepdim=True)
+            edit_direction_embed.requires_grad_(False)
+            text_projection = clip_model.text_projection
+            text_projection.requires_grad_(False)
+            text_projection.eval()
+
+        return text_projection, edit_direction_embed, mask_image
+
     def train(
         self,
         prompt: Union[str, List[str]],
@@ -809,6 +911,7 @@ class StableDiffusionVisii(DiffusionPipeline):
         eval_step: int=200,
         clip_loss: bool = True,
         log_dir: str = './logs',
+        top_percent: int = 10,
         **kwargs,
     ):
         accelerator = Accelerator(
@@ -838,8 +941,11 @@ class StableDiffusionVisii(DiffusionPipeline):
         self.unet.eval()
         self.vae.eval()
         self.text_encoder.eval()
+        # Remove the top 10% similar patches between target and cond images
+        self.remove_similar_patches(cond_images, target_images)
         if clip_loss:
-            text_projection, edit_direction_embed = self.text_projection2(cond_images, target_images, device=device)
+            text_projection, edit_direction_embed, mask_image = self.text_projection2_edited(cond_images, target_images,top_percent, device=device)
+            mask_image.save(os.path.join(log_dir, exp_name, 'mask_top_'+str(top_percent)+'.png'))
             torch.cuda.empty_cache()
 
         do_classifier_free_guidance = guidance_scale > 1.0 and image_guidance_scale >= 1.0
